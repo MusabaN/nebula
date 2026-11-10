@@ -1,0 +1,119 @@
+name: Sync upstream
+
+# Keeps this fork current with AgentSystemLabs/nebula. Once a day it mirrors
+# upstream's main onto the `upstream-sync` branch here and keeps one pull
+# request open from that branch into main. Nothing lands on main by itself:
+# the pull request runs CI, shows any conflict with this fork's own changes,
+# and is merged by a person. See docs/fork-sync.md.
+
+on:
+  schedule:
+    # 05:17 UTC every day. Off the hour, where scheduled runs queue up.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: AgentSystemLabs/nebula
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    name: Mirror upstream and open the sync pull request
+    # Inert in the upstream repository itself, should this file ever land there.
+    if: github.repository != 'AgentSystemLabs/nebula'
+    runs-on: ubuntu-latest
+    env:
+      # The built-in token cannot push commits that change workflow files and
+      # the pull requests it opens do not start CI. A personal access token
+      # in UPSTREAM_SYNC_TOKEN (contents, pull requests and workflows: write)
+      # lifts both limits; without one the built-in token is used.
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+    steps:
+      - name: Checkout the fork with full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Branch only: upstream's release tags would start this fork's
+          # release workflow if they were pushed here.
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+      - name: Update the sync branch
+        id: update
+        run: |
+          set -euo pipefail
+          default="origin/${{ github.event.repository.default_branch }}"
+          upstream="upstream/${UPSTREAM_BRANCH}"
+          sync="origin/${SYNC_BRANCH}"
+
+          behind=$(git rev-list --count "${default}..${upstream}")
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          if [ "${behind}" -eq 0 ]; then
+            echo "::notice::Already up to date with ${UPSTREAM_REPO}."
+            exit 0
+          fi
+
+          push_failed() {
+            echo "::error::Could not push ${SYNC_BRANCH}. If upstream changed a file under .github/workflows, the built-in token is refused: add a personal access token as the UPSTREAM_SYNC_TOKEN secret (see docs/fork-sync.md)."
+            exit 1
+          }
+
+          if ! git rev-parse --verify --quiet "${sync}" >/dev/null; then
+            # First run: the sync branch is upstream's main, as is.
+            git push origin "${upstream}:refs/heads/${SYNC_BRANCH}" || push_failed
+          elif git merge-base --is-ancestor "${upstream}" "${sync}"; then
+            echo "::notice::${SYNC_BRANCH} already holds upstream's latest commits."
+          elif git merge-base --is-ancestor "${sync}" "${upstream}"; then
+            # Nothing of ours on the branch: fast-forward it to upstream.
+            git push origin "${upstream}:refs/heads/${SYNC_BRANCH}" || push_failed
+          else
+            # The branch carries commits upstream does not have, such as a
+            # conflict resolved in the pull request. Keep them: merge the new
+            # upstream commits in rather than overwrite the branch.
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B "${SYNC_BRANCH}" "${sync}"
+            if ! git merge --no-edit "${upstream}"; then
+              git merge --abort
+              echo "::error::New upstream commits conflict with the commits already on ${SYNC_BRANCH}. Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} into ${SYNC_BRANCH} by hand (see docs/fork-sync.md)."
+              exit 1
+            fi
+            git push origin "${SYNC_BRANCH}" || push_failed
+          fi
+
+      - name: Open the sync pull request
+        if: steps.update.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          base="${{ github.event.repository.default_branch }}"
+          open=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${SYNC_BRANCH}" --base "${base}" --state open --json number --jq 'length')
+          if [ "${open}" -ne 0 ]; then
+            echo "::notice::The sync pull request is already open."
+            exit 0
+          fi
+          {
+            echo "Brings in the ${{ steps.update.outputs.behind }} commit(s) on [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) \`${UPSTREAM_BRANCH}\` that this fork does not have yet."
+            echo
+            echo "- **Merge with a merge commit**, not squash or rebase. The next sync finds what is already merged through that commit; a squash makes every later sync conflict."
+            echo "- If GitHub reports conflicts, resolve them on this branch. Later syncs keep the resolution."
+            echo "- If no checks started, close and reopen this pull request, or add the \`UPSTREAM_SYNC_TOKEN\` secret described in \`docs/fork-sync.md\`."
+            echo
+            echo "Opened by the Sync upstream workflow; it keeps this branch current until the pull request is merged."
+          } > "${RUNNER_TEMP}/sync-body.md"
+          gh pr create --repo "${GITHUB_REPOSITORY}" \
+            --head "${SYNC_BRANCH}" --base "${base}" \
+            --title "Sync with ${UPSTREAM_REPO}" \
+            --body-file "${RUNNER_TEMP}/sync-body.md"
